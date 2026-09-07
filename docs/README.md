@@ -23,6 +23,7 @@ Se é seu primeiro contato, comece pelo [tutorial](tutorial/): em quinze minutos
 - [Investigar um 429 inesperado](how-to/investigate-429.md)
 - [Ajustar timeouts, retry e circuit breaker](how-to/tune-resilience.md)
 - [Investigar um 502, 503 ou 504](how-to/investigate-upstream-failures.md)
+- [Acompanhar uma requisição de ponta a ponta](how-to/trace-a-request.md)
 
 ## Reference
 

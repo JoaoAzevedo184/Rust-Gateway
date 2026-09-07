@@ -61,6 +61,21 @@ A claim de escopo é lida no formato OAuth2 — string separada por espaço — 
 
 `memory` conta por processo. Com múltiplas réplicas, o limite efetivo vira N vezes o configurado — veja [subir múltiplas réplicas](../how-to/multiple-replicas.md).
 
+## `tracing`
+
+Seção opcional.
+
+| Campo | Tipo | Default | Descrição |
+|---|---|---|---|
+| `otlp_endpoint` | URL | — | Coletor OTLP/HTTP (protobuf) para onde os spans são exportados. |
+
+```yaml
+tracing:
+  otlp_endpoint: http://otel-collector:4318/v1/traces
+```
+
+Ausente a seção inteira, nenhum span é exportado — mas a propagação de `traceparent` W3C continua ativa de qualquer forma, porque ela não depende de exportação. Veja [tracing distribuído](observability.md#tracing-distribuído).
+
 ## `resilience`
 
 Política herdada em três níveis, resolvida **campo a campo**: `resilience.default` → `upstreams.<id>.resilience` → `routes[].resilience`. Um `retry` parcial na rota não zera o `backoff` herdado do upstream.
@@ -193,7 +208,7 @@ rate_limit:
 | `match.prefix` sem `/` inicial | `precisa começar com /` |
 | `capacity` zero, ou `refill_per_sec` não positivo | `precisa ser maior que zero` |
 | `store: redis` sem `redis_url` | `exige rate_limit.redis_url` |
-| URL de upstream ou de JWKS malformada | `não é uma URL válida` |
+| URL de upstream, de JWKS ou de `tracing.otlp_endpoint` malformada | `não é uma URL válida` |
 | `stale_max_age` menor que `refresh_interval` | `o cache expiraria antes do primeiro refresh` |
 | `request_timeout` menor que `upstream_timeout` | `o teto global cortaria antes da tentativa individual` |
 | `circuit_breaker` definido em uma rota | `o estado do breaker é por upstream` |
