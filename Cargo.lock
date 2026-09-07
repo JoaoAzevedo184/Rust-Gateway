@@ -1475,6 +1475,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "http",
+ "http-body",
  "http-body-util",
  "humantime-serde",
  "hyper",
