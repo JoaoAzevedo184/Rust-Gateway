@@ -8,6 +8,7 @@
 //!   circuit breaker no meio de um incidente.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -19,11 +20,13 @@ use crate::observability::metrics::Metrics;
 use crate::peer::TrustedProxies;
 use crate::proxy::ProxyClient;
 use crate::ratelimit::limiter::RateLimiter;
+use crate::resilience::breaker::BreakerRegistry;
 use crate::routing::table::RouterTable;
 
 #[derive(Debug, Clone)]
 pub struct ServerSettings {
     pub max_body_bytes: u64,
+    pub request_timeout: Duration,
     pub trusted_proxies: TrustedProxies,
 }
 
@@ -35,6 +38,9 @@ pub struct AppState {
     /// Ausente quando não há seção `auth` — configuração sem rota autenticada.
     pub authenticator: Option<Arc<Authenticator>>,
     pub limiter: Arc<RateLimiter>,
+    /// Estado dos circuitos, chaveado por upstream. Vive aqui, e não no snapshot,
+    /// para que um reload de configuração não zere o breaker no meio de um incidente.
+    pub breakers: Arc<BreakerRegistry>,
     pub proxy: Arc<ProxyClient>,
     pub metrics: Arc<Metrics>,
     pub clock: Arc<dyn Clock>,
@@ -58,6 +64,7 @@ impl ServerSettings {
     pub fn from_config(config: &Config) -> Self {
         Self {
             max_body_bytes: config.server.max_body_bytes,
+            request_timeout: config.server.request_timeout,
             trusted_proxies: TrustedProxies::new(config.server.trusted_proxies.clone()),
         }
     }

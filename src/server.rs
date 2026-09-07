@@ -28,6 +28,9 @@ use crate::ratelimit::limiter::RateLimiter;
 use crate::ratelimit::memory::MemoryStore;
 use crate::ratelimit::redis::RedisStore;
 use crate::ratelimit::store::RateLimitStore;
+use crate::resilience::breaker::{BreakerRegistry, CircuitBreakerLayer};
+use crate::resilience::retry::RetryLayer;
+use crate::resilience::timeout::{RequestTimeoutLayer, UpstreamTimeoutLayer};
 use crate::state::{AppState, ServerSettings};
 use crate::{BoxFuture, Request, Response};
 
@@ -42,6 +45,15 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// Depois de `route_resolve` vêm os layers **por rota**, que leem o
 /// `RouteRuntime` das extensions e viram no-op quando a rota não pede.
+///
+/// A ordem entre os três layers de resiliência é a decisão, não um detalhe:
+///
+/// - `rate_limit` fica **fora** de `retry`: uma tentativa extra não pode consumir
+///   um segundo token do usuário, que não pediu duas requisições.
+/// - `circuit_breaker` fica **dentro** de `retry`: assim registra o resultado de
+///   cada tentativa em vez de um agregado por requisição, e corta a segunda
+///   tentativa imediatamente quando o circuito abre.
+/// - `upstream_timeout` é o mais interno: seu escopo é uma tentativa.
 pub fn gateway_service(
     state: &AppState,
 ) -> impl Service<Request, Response = Response, Error = Infallible, Future: Send> + Clone + Send + 'static
@@ -51,6 +63,7 @@ pub fn gateway_service(
         .layer(IdentityScrubLayer)
         .layer(SpanLayer)
         .layer(MetricsLayer::new(state.metrics.clone()))
+        .layer(RequestTimeoutLayer::new(state.server.request_timeout))
         .layer(BodyLimitLayer::new(state.server.max_body_bytes))
         .layer(crate::routing::layer::RouteResolveLayer::new(
             state.table.clone(),
@@ -60,6 +73,9 @@ pub fn gateway_service(
             state.limiter.clone(),
             state.server.trusted_proxies.clone(),
         ))
+        .layer(RetryLayer::new(state.server.max_body_bytes))
+        .layer(CircuitBreakerLayer::new(state.breakers.clone()))
+        .layer(UpstreamTimeoutLayer)
         .service(ProxyService::new(state.proxy.clone()))
 }
 
@@ -135,6 +151,7 @@ pub async fn build_state(
         server,
         authenticator,
         limiter,
+        breakers: Arc::new(BreakerRegistry::new(clock.clone())),
         proxy,
         metrics,
         clock,

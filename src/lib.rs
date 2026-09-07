@@ -11,6 +11,7 @@ pub mod observability;
 pub mod peer;
 pub mod proxy;
 pub mod ratelimit;
+pub mod resilience;
 pub mod routing;
 pub mod server;
 pub mod state;
