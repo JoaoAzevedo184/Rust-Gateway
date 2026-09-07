@@ -17,19 +17,15 @@ exposto.
 
 ## Estado
 
-**Fases 1 e 2 implementadas.** O gateway roteia, autentica, limita taxa, encaminha
-e se protege de upstreams doentes, com Docker Compose subindo o ambiente completo.
+**Fases 1, 2 e 3 implementadas.** O gateway roteia, autentica, limita taxa, encaminha,
+se protege de upstreams doentes e expõe a superfície completa de observabilidade da
+spec, com Docker Compose subindo o ambiente completo.
 
 | Fase | Conteúdo | Estado |
 |---|---|---|
 | 1 — núcleo | Configuração, roteamento, proxy, JWT/JWKS, rate limiting, health/ready | Implementada |
 | 2 — resiliência | Três timeouts, retry, circuit breaker | Implementada |
-| 3 — observabilidade | Superfície completa de métricas, OpenTelemetry, benchmarks | Especificada |
-
-A Fase 3 acrescenta as famílias de métrica que faltam — `gateway_circuit_state`,
-`gateway_retries_total`, `gateway_upstream_duration_seconds` — e a propagação de
-`traceparent` W3C. Até lá, o circuit breaker é observável pelo label
-`outcome="circuit_open"` e pelas transições no log.
+| 3 — observabilidade | Superfície completa de métricas, OpenTelemetry, benchmarks de carga | Implementada |
 
 ## O que o gateway faz
 
@@ -41,8 +37,9 @@ A Fase 3 acrescenta as famílias de métrica que faltam — `gateway_circuit_sta
   anônimas, com estado compartilhado no Redis para múltiplas réplicas.
 - **Resiliência**: três níveis de timeout, retry restrito a métodos idempotentes e a
   falhas pré-resposta, circuit breaker por upstream com janela deslizante.
-- **Observabilidade**: correlation ID, logs JSON estruturados e métricas Prometheus.
-  Propagação de contexto de trace W3C na Fase 3.
+- **Observabilidade**: correlation ID, logs JSON estruturados, a superfície completa de
+  métricas Prometheus da spec e propagação de `traceparent` W3C, com exportação OTLP
+  opcional.
 
 ## O que ele deliberadamente não faz
 
@@ -131,13 +128,40 @@ Sem Docker, com um toolchain Rust 1.85 ou mais novo:
 
 ```bash
 cargo run -- config/gateway.yaml              # o caminho da config é o argumento
-cargo test                                    # 118 testes
+cargo test                                    # 132 testes
 REDIS_URL=redis://127.0.0.1:6379 cargo test   # inclui a conformance do store Redis
 ```
 
 A arquitetura não assume instância única: subir múltiplas réplicas exige apenas
 `store: redis` na configuração.
 
+### Tracing distribuído
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.tracing.yml up --build
+```
+
+Sobe um Jaeger com o receptor OTLP ligado, e troca a configuração do gateway por uma
+com `tracing.otlp_endpoint` apontando para ele. A UI fica em `localhost:16686`. A
+propagação de `traceparent` W3C funciona com ou sem este overlay — ele só liga o
+destino dos spans; veja [tracing distribuído](docs/reference/observability.md#tracing-distribuído).
+
 ## Métricas de referência
 
-Ao fim da Fase 3: requisições por segundo, P50, P95, P99, CPU e RAM sob carga.
+Medido com [`scripts/load-test.sh`](scripts/load-test.sh) (`oha`) contra o Compose
+padrão, em uma rota anônima e sem rate limit efetivo, para isolar o overhead do
+gateway em si. Máquina de desenvolvimento com 12 vCPUs, compartilhada com outras
+cargas — não é um rack dedicado, então trate como indicativo, não como cota.
+
+| Concorrência | RPS | P50 | P95 | P99 | CPU do gateway | RAM |
+|---|---|---|---|---|---|---|
+| 50 | ~28 500 | 1,6 ms | 2,9 ms | 3,8 ms | ~4,8 núcleos | ~16 MiB |
+| 200 | ~30 300 | 6,2 ms | 10,6 ms | 13,8 ms | ~5,5 núcleos | ~32 MiB |
+| 500 | ~29 000 | 16,7 ms | 25,0 ms | 30,1 ms | ~5,7 núcleos | ~69 MiB |
+
+Sem erros em nenhum nível de carga testado — a rota rejeitada por `aborted due to
+deadline` no relatório do `oha` é só a cauda de requisições em voo quando o teste
+termina, não uma falha do gateway. O throughput satura por volta de 29–30 mil req/s
+nesta máquina; RAM cresce com o número de conexões simultâneas em voo, não com o
+tempo de execução.
+
