@@ -459,6 +459,17 @@ impl Config {
                 }
             }
 
+            if route
+                .resilience
+                .as_ref()
+                .is_some_and(|r| r.circuit_breaker.is_some())
+            {
+                problems.push(format!(
+                    "routes.{id}: circuit_breaker não pode ser definido na rota. O estado do breaker é por upstream (D8), e rotas para o mesmo serviço compartilham o circuito — configure em upstreams.{}.resilience",
+                    route.upstream
+                ));
+            }
+
             let resilience = self.resolved_resilience(route);
             if self.server.request_timeout < resilience.upstream_timeout {
                 problems.push(format!(
@@ -799,6 +810,33 @@ routes:
         assert_eq!(
             slow.retry.max_attempts, 0,
             "o resto continua vindo do upstream"
+        );
+    }
+
+    #[test]
+    fn circuit_breaker_na_rota_e_erro_de_startup() {
+        let problems = erros(&com_routes(
+            "  - id: users\n    match: { prefix: /users }\n    upstream: user-service\n    auth: { required: false }\n    resilience:\n      circuit_breaker: { open_for: 10s }\n",
+        ));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("estado do breaker é por upstream")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn resiliencia_sem_circuit_breaker_na_rota_e_aceita() {
+        let yaml = com_routes(
+            "  - id: users\n    match: { prefix: /users }\n    upstream: user-service\n    auth: { required: false }\n    resilience:\n      upstream_timeout: 9s\n",
+        );
+        let config = Config::parse(&yaml, "teste").unwrap();
+        assert_eq!(
+            config
+                .resolved_resilience(&config.routes[0])
+                .upstream_timeout,
+            Duration::from_secs(9)
         );
     }
 

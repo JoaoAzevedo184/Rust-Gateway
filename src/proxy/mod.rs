@@ -3,6 +3,7 @@
 pub mod limit;
 pub mod scrub;
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -20,6 +21,7 @@ use tower::Service;
 use crate::error::GatewayError;
 use crate::observability::metrics::{self, Outcome};
 use crate::peer::{PeerAddr, TrustedProxies};
+use crate::resilience::AttemptOutcome;
 use crate::routing::layer::route_of;
 use crate::{BoxFuture, Request, Response};
 
@@ -58,8 +60,15 @@ pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
+type HttpClient = Client<HttpConnector, Body>;
+
 pub struct ProxyClient {
-    client: Client<HttpConnector, Body>,
+    /// Um cliente por `connect_timeout` distinto. O timeout de conexão é
+    /// propriedade do conector, fixada quando o cliente é construído, então
+    /// honrar a herança por upstream exige um pool por valor configurado — e não
+    /// um por upstream, porque o caso comum é todos compartilharem o default.
+    clients: HashMap<Duration, HttpClient>,
+    fallback: HttpClient,
     trusted: TrustedProxies,
 }
 
@@ -72,17 +81,35 @@ impl std::fmt::Debug for ProxyClient {
 impl ProxyClient {
     /// Cliente hyper com pool de conexões, em vez de `reqwest`, por controle
     /// explícito sobre pooling e timeouts.
-    pub fn new(trusted: TrustedProxies, connect_timeout: Option<Duration>) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(connect_timeout);
-        connector.set_nodelay(true);
+    pub fn new(
+        trusted: TrustedProxies,
+        connect_timeouts: impl IntoIterator<Item = Duration>,
+    ) -> Self {
+        let clients = connect_timeouts
+            .into_iter()
+            .map(|timeout| (timeout, build_client(Some(timeout))))
+            .collect();
 
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build(connector);
-
-        Self { client, trusted }
+        Self {
+            clients,
+            fallback: build_client(None),
+            trusted,
+        }
     }
+
+    fn client_for(&self, connect_timeout: Duration) -> &HttpClient {
+        self.clients.get(&connect_timeout).unwrap_or(&self.fallback)
+    }
+}
+
+fn build_client(connect_timeout: Option<Duration>) -> HttpClient {
+    let mut connector = HttpConnector::new();
+    connector.set_connect_timeout(connect_timeout);
+    connector.set_nodelay(true);
+
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build(connector)
 }
 
 #[derive(Debug, Clone)]
@@ -142,30 +169,40 @@ impl Service<Request> for ProxyService {
 
         *req.uri_mut() = target;
 
+        let connect_timeout = route.upstream.resilience.connect_timeout;
+
         Box::pin(async move {
             let upstream_id = route.upstream.id.clone();
 
-            match client.client.request(req).await {
+            match client.client_for(connect_timeout).request(req).await {
                 Ok(upstream) => {
                     let (mut parts, body) = upstream.into_parts();
                     strip_hop_by_hop(&mut parts.headers);
 
-                    let outcome = if parts.status.is_server_error() {
-                        Outcome::UpstreamError
+                    let (outcome, attempt) = if parts.status.is_server_error() {
+                        (Outcome::UpstreamError, AttemptOutcome::ServerError)
                     } else {
-                        Outcome::Ok
+                        (Outcome::Ok, AttemptOutcome::Success)
                     };
                     metrics::mark(&extensions, outcome);
 
                     // O corpo do upstream é repassado em streaming, sem bufferizar:
                     // um download de 100 MB não pode virar 100 MB de RAM.
-                    Ok(http::Response::from_parts(parts, Body::new(body)))
+                    let mut response = http::Response::from_parts(parts, Body::new(body));
+                    attempt.mark(&mut response);
+                    Ok(response)
                 }
                 Err(err) => {
                     tracing::warn!(upstream = %upstream_id, error = %err, "falha ao encaminhar para o upstream");
                     metrics::mark(&extensions, Outcome::UpstreamError);
-                    Ok(GatewayError::bad_gateway("Upstream is unreachable")
-                        .into_response_for(&extensions))
+
+                    // Um erro devolvido pelo cliente significa que nenhuma resposta
+                    // chegou: a falha é comprovadamente pré-resposta, e portanto a
+                    // única condição em que repetir é seguro.
+                    let mut response = GatewayError::bad_gateway("Upstream is unreachable")
+                        .into_response_for(&extensions);
+                    AttemptOutcome::PreResponseFailure.mark(&mut response);
+                    Ok(response)
                 }
             }
         })
