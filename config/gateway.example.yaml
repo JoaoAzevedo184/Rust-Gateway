@@ -1,0 +1,84 @@
+# Schema completo, com todos os campos e seus defaults.
+#
+# Campos omitidos assumem o default mostrado em comentário. Campo desconhecido é
+# erro de startup: um typo em `strip_prefix` não pode virar uma rota que
+# silenciosamente não faz o que se pediu.
+
+server:
+  bind: 0.0.0.0:8080
+  admin_bind: 0.0.0.0:9090           # /metrics, /health e /ready
+  request_timeout: 30s               # teto por requisição, incluindo retries (Fase 2)
+  max_body_bytes: 2MiB               # aceita 1024, 2MiB, 10 MB
+  trusted_proxies: []                # CIDRs; vazio = ignora X-Forwarded-For
+
+# Seção opcional. Obrigatória se alguma rota declarar auth.required: true.
+auth:
+  jwks_url: http://auth-service:9000/.well-known/jwks.json
+  issuer: https://auth.homelab.local
+  audience: rust-gateway
+  refresh_interval: 5m               # refresh proativo em background
+  stale_max_age: 30m                 # janela de aceitação de cache stale
+  leeway: 30s                        # tolerância de clock em exp/nbf
+  unknown_kid_cooldown: 30s          # intervalo mínimo entre refreshes forçados
+  scope_claim: scope
+
+rate_limit:
+  store: memory                      # memory | redis
+  redis_url: redis://redis:6379      # obrigatório quando store: redis
+  redis_timeout: 50ms
+
+# Herdada na ordem: default -> upstreams.<id>.resilience -> routes[].resilience,
+# campo a campo. Fase 1 aplica apenas connect_timeout; o resto entra na Fase 2.
+resilience:
+  default:
+    connect_timeout: 2s
+    upstream_timeout: 5s
+    retry: { max_attempts: 2, backoff: 50ms, jitter: true }
+    circuit_breaker:
+      failure_ratio: 0.5
+      min_requests: 20
+      window: 30s
+      open_for: 15s
+      half_open_probes: 1
+
+# Upstreams são nomeados, não URLs inline: o estado de circuit breaker é por
+# upstream, e rotas distintas para o mesmo serviço precisam compartilhá-lo.
+upstreams:
+  user-service: { url: http://user-service:8080 }
+  order-service: { url: http://order-service:8081 }
+  payment-service:
+    url: http://payment-service:8082
+    resilience:
+      upstream_timeout: 15s
+      retry: { max_attempts: 0 }     # pagamento nunca retria
+
+routes:
+  # `auth` é obrigatório em toda rota, inclusive para declarar required: false.
+  - id: users
+    match: { prefix: /users }        # casa /users e /users/42, não casa /usersecret
+    upstream: user-service
+    strip_prefix: false
+    auth: { required: true, scopes: [user.read] }   # scopes são conjunção
+    rate_limit:                      # lista: todos os limites precisam passar
+      - { key: sub, capacity: 600, refill_per_sec: 10 }
+      - { key: ip, capacity: 2000, refill_per_sec: 50 }
+
+  - id: users-signup
+    match: { prefix: /users/signup } # prefixo mais longo vence
+    upstream: user-service
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 5, refill_per_sec: 0.1 }
+
+  - id: orders
+    match: { prefix: /orders }
+    upstream: order-service
+    strip_prefix: true               # /orders/42 -> upstream /42
+    auth: { required: true, scopes: [order.read] }
+
+  - id: payments
+    match: { prefix: /payments }
+    upstream: payment-service
+    auth: { required: true, scopes: [payment.write] }
+    rate_limit:
+      - { key: sub, capacity: 30, refill_per_sec: 0.5 }
