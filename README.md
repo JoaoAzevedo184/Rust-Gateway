@@ -17,14 +17,18 @@ exposto.
 
 ## Estado
 
-**Fase 1 em design concluído, implementação não iniciada.** O código atual é um
-esqueleto com `/health`.
+**Fase 1 implementada.** O gateway roteia, autentica, limita taxa e encaminha, com
+Docker Compose subindo o ambiente completo.
 
 | Fase | Conteúdo | Estado |
 |---|---|---|
-| 1 — núcleo | Configuração, roteamento, proxy, JWT/JWKS, rate limiting, health/ready | Especificado |
-| 2 — resiliência | Timeouts, retry, circuit breaker | Especificado |
-| 3 — observabilidade | Métricas completas, OpenTelemetry, benchmarks | Especificado |
+| 1 — núcleo | Configuração, roteamento, proxy, JWT/JWKS, rate limiting, health/ready | Implementada |
+| 2 — resiliência | Timeouts, retry, circuit breaker | Especificada |
+| 3 — observabilidade | Métricas completas, OpenTelemetry, benchmarks | Especificada |
+
+Da Fase 2, só `connect_timeout` está em vigor. `upstream_timeout`,
+`request_timeout`, retry e circuit breaker são lidos e validados na configuração,
+mas ainda não aplicados no caminho da requisição.
 
 ## O que o gateway faz
 
@@ -34,10 +38,10 @@ esqueleto com `/health`.
   Auth Service.
 - **Rate limiting** token bucket, por `sub` em rotas autenticadas e por IP em rotas
   anônimas, com estado compartilhado no Redis para múltiplas réplicas.
-- **Resiliência**: três níveis de timeout, retry restrito a métodos idempotentes e falhas
-  pré-resposta, circuit breaker por upstream.
-- **Observabilidade**: correlation ID, logs JSON estruturados, métricas Prometheus e
-  propagação de contexto de trace W3C.
+- **Resiliência** (Fase 2): três níveis de timeout, retry restrito a métodos idempotentes
+  e falhas pré-resposta, circuit breaker por upstream.
+- **Observabilidade**: correlation ID, logs JSON estruturados e métricas Prometheus.
+  Propagação de contexto de trace W3C na Fase 3.
 
 ## O que ele deliberadamente não faz
 
@@ -74,8 +78,11 @@ routes:
       - { key: ip, capacity: 5, refill_per_sec: 0.1 }
 ```
 
-O schema completo, com defaults e regras de validação, está na
-[spec de design](docs/superpowers/specs/2026-09-06-rust-gateway-design.md#5-configuração).
+[`config/gateway.example.yaml`](config/gateway.example.yaml) documenta todos os
+campos com seus defaults; [`config/gateway.yaml`](config/gateway.yaml) é o que o
+Compose sobe. Configuração inválida impede o processo de subir, e a validação
+reporta todos os problemas de uma vez — descobrir um erro por vez, com um restart
+entre cada, torna a edição de config um exercício de paciência.
 
 ## Stack
 
@@ -99,10 +106,40 @@ O quadrante **Explanation** está escrito e explica o racional de cada decisão:
 
 Reference, How-to e Tutorial são escritos junto com a Fase 1, verificados contra o binário.
 
-## Ambiente
+## Como rodar
 
-Docker Compose no início, com gateway, Redis e upstreams. A arquitetura não assume
-instância única: subir múltiplas réplicas exige apenas `store: redis` na configuração.
+```bash
+docker compose up --build
+```
+
+Sobe o gateway em `localhost:8080`, um Redis e três upstreams stub
+(`traefik/whoami`, que ecoa os headers recebidos — conveniente para ver o que o
+gateway injetou e o que removeu).
+
+```bash
+curl localhost:8080/users/perfil                   # roteia para user-service
+curl localhost:8080/orders/42                      # strip_prefix: chega como /42
+curl -H 'X-User-Id: forjado' localhost:8080/users  # o header não sobrevive à borda
+curl -i localhost:8080/payments                    # X-RateLimit-* na resposta
+```
+
+A porta administrativa (9090) não é publicada de propósito: `/metrics` e `/ready`
+não passam pela pilha de políticas e não deveriam estar expostos. De dentro da rede:
+
+```bash
+docker compose run --rm --entrypoint sh redis -c 'wget -qO- http://gateway:9090/metrics'
+```
+
+Sem Docker, com um toolchain Rust 1.85 ou mais novo:
+
+```bash
+cargo run -- config/gateway.yaml              # o caminho da config é o argumento
+cargo test                                    # 88 testes
+REDIS_URL=redis://127.0.0.1:6379 cargo test   # inclui a conformance do store Redis
+```
+
+A arquitetura não assume instância única: subir múltiplas réplicas exige apenas
+`store: redis` na configuração.
 
 ## Métricas de referência
 
