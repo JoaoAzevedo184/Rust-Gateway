@@ -1,0 +1,53 @@
+# Configuração com exportação OTLP ligada, usada por docker-compose.tracing.yml.
+#
+# Idêntica a gateway.yaml, com a seção `tracing` acrescentada. O coletor é o
+# Jaeger do overlay, que recebe OTLP/HTTP na porta 4318.
+
+server:
+  bind: 0.0.0.0:8080
+  admin_bind: 0.0.0.0:9090
+  max_body_bytes: 2MiB
+  trusted_proxies: []
+
+rate_limit:
+  store: redis
+  redis_url: redis://redis:6379
+  redis_timeout: 50ms
+
+tracing:
+  otlp_endpoint: http://jaeger:4318/v1/traces
+
+upstreams:
+  user-service: { url: http://user-service:80 }
+  order-service: { url: http://order-service:80 }
+  payment-service: { url: http://payment-service:80 }
+
+routes:
+  - id: users
+    match: { prefix: /users }
+    upstream: user-service
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 100, refill_per_sec: 10 }
+
+  - id: users-signup
+    match: { prefix: /users/signup }
+    upstream: user-service
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 5, refill_per_sec: 0.1 }
+
+  - id: orders
+    match: { prefix: /orders }
+    upstream: order-service
+    strip_prefix: true
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 200, refill_per_sec: 20 }
+
+  - id: payments
+    match: { prefix: /payments }
+    upstream: payment-service
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 30, refill_per_sec: 0.5 }

@@ -7,7 +7,7 @@
 server:
   bind: 0.0.0.0:8080
   admin_bind: 0.0.0.0:9090           # /metrics, /health e /ready
-  request_timeout: 30s               # teto por requisição, incluindo retries (Fase 2)
+  request_timeout: 30s               # teto por requisição, incluindo retries
   max_body_bytes: 2MiB               # aceita 1024, 2MiB, 10 MB
   trusted_proxies: []                # CIDRs; vazio = ignora X-Forwarded-For
 
@@ -26,6 +26,12 @@ rate_limit:
   store: memory                      # memory | redis
   redis_url: redis://redis:6379      # obrigatório quando store: redis
   redis_timeout: 50ms
+
+# Seção opcional. Ausente, nenhum span sai do processo — mas a propagação de
+# traceparent W3C continua ativa de qualquer forma, porque não depende de
+# exportação.
+tracing:
+  otlp_endpoint: http://otel-collector:4318/v1/traces
 
 # Herdada na ordem: default -> upstreams.<id>.resilience -> routes[].resilience,
 # campo a campo. circuit_breaker é a exceção: só vale em default ou no upstream,
