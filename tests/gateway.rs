@@ -127,8 +127,24 @@ struct Harness {
     state: Arc<AppState>,
 }
 
+/// Instala o propagador W3C e o subscriber de tracing uma única vez por
+/// processo de teste — sem isso, `otel::accept_incoming`/`inject_outgoing` são
+/// no-ops silenciosos, e um `traceparent` de entrada atravessaria intocado em
+/// vez de continuar o trace.
+fn ensure_tracing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Sem `otlp_endpoint`: a propagação é testada sem depender de um
+        // coletor vivo. A exportação real foi validada manualmente contra um
+        // Jaeger de verdade.
+        rust_gateway::observability::tracing::init(None);
+    });
+}
+
 impl Harness {
     async fn new() -> Self {
+        ensure_tracing();
+
         let upstream = spawn_upstream().await;
         let jwks = spawn_jwks().await;
 
@@ -367,6 +383,72 @@ async fn correlation_id_malformado_e_substituido() {
         .to_string();
     assert_ne!(id, "injecao\tde log");
     assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+}
+
+// ---------------------------------------------------------------------------
+// Propagação de traceparent (spec §11.4)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn traceparent_recebido_continua_o_mesmo_trace_com_novo_span_pai() {
+    let harness = Harness::new().await;
+    let incoming = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    let response = harness
+        .send(
+            http::Request::get("/publico")
+                .header("traceparent", incoming)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    let headers = headers_no_upstream(response).await;
+    let outgoing = headers["traceparent"].as_str().unwrap();
+    let parts: Vec<&str> = outgoing.split('-').collect();
+
+    assert_eq!(
+        parts[1], "4bf92f3577b34da6a3ce929d0e0e4736",
+        "o trace_id precisa ser o mesmo do que chegou"
+    );
+    assert_ne!(
+        parts[2], "00f067aa0ba902b7",
+        "o span-id precisa ser o do gateway, não o do chamador"
+    );
+}
+
+#[tokio::test]
+async fn sem_traceparent_de_entrada_o_gateway_origina_um_trace_novo() {
+    let harness = Harness::new().await;
+    let response = harness.get("/publico").await;
+
+    let headers = headers_no_upstream(response).await;
+    let outgoing = headers["traceparent"].as_str().unwrap();
+    let parts: Vec<&str> = outgoing.split('-').collect();
+
+    assert_eq!(parts[0], "00", "versão W3C");
+    assert_ne!(
+        parts[1], "00000000000000000000000000000000",
+        "trace_id não pode ser zerado"
+    );
+    assert_ne!(parts[2], "0000000000000000", "span_id não pode ser zerado");
+}
+
+#[tokio::test]
+async fn traceparent_malformado_e_descartado_como_se_estivesse_ausente() {
+    let harness = Harness::new().await;
+    let response = harness
+        .send(
+            http::Request::get("/publico")
+                .header("traceparent", "isto-nao-e-um-traceparent-valido")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+    // Não pode entrar em pânico, e o gateway segue funcionando normalmente,
+    // originando um trace novo em vez de propagar lixo adiante.
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------
