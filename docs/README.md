@@ -2,14 +2,34 @@
 
 Esta documentação segue o [framework Diátaxis](https://diataxis.fr/), que separa documentação por aquilo que o leitor precisa no momento.
 
-| Quadrante | Serve para | Estado |
-|---|---|---|
-| [Explanation](explanation/) | Entender por que o gateway é como é | Disponível |
-| [Reference](reference/) | Consultar campos, códigos e métricas | Fase 1 |
-| [How-to](how-to/) | Resolver uma tarefa específica | Fase 1 |
-| [Tutorial](tutorial/) | Aprender do zero, com o gateway rodando | Fase 1 |
+| Quadrante | Serve para |
+|---|---|
+| [Tutorial](tutorial/) | Aprender do zero, com o gateway rodando |
+| [How-to](how-to/) | Resolver uma tarefa específica |
+| [Reference](reference/) | Consultar campos, códigos e métricas |
+| [Explanation](explanation/) | Entender por que o gateway é como é |
 
-Os três últimos quadrantes descrevem software em funcionamento e serão escritos junto com o código da Fase 1, verificados contra o binário real. Documentação de uso escrita antes do uso erra nos detalhes, e detalhe errado é pior que ausência.
+Se é seu primeiro contato, comece pelo [tutorial](tutorial/): em quinze minutos você sobe o gateway e faz um request autenticado atravessá-lo.
+
+## Tutorial
+
+- [Do clone ao primeiro request autenticado](tutorial/) — uma lição guiada, com o ambiente completo no Docker.
+
+## How-to
+
+- [Adicionar uma rota](how-to/add-a-route.md)
+- [Proteger uma rota com autenticação e escopos](how-to/protect-a-route.md)
+- [Subir múltiplas réplicas](how-to/multiple-replicas.md)
+- [Investigar um 429 inesperado](how-to/investigate-429.md)
+- [Ajustar timeouts, retry e circuit breaker](how-to/tune-resilience.md)
+- [Investigar um 502, 503 ou 504](how-to/investigate-upstream-failures.md)
+
+## Reference
+
+- [Configuração](reference/configuration.md) — todo campo do YAML, com tipo, default e regra de validação.
+- [Erros](reference/errors.md) — códigos de status, corpo de erro e o que cada situação produz.
+- [Headers](reference/headers.md) — o que o gateway remove, reescreve e injeta, em cada sentido.
+- [Observabilidade](reference/observability.md) — endpoints administrativos e métricas com seus labels.
 
 ## Explanation
 
