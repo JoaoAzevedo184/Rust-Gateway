@@ -1,0 +1,270 @@
+//! Montagem da pilha e bootstrap dos dois listeners (spec §4.1, §11.1).
+
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use axum::serve::IncomingStream;
+use tokio::net::TcpListener;
+use tower::{Service, ServiceBuilder};
+
+use crate::auth::jwks::{JwksCache, JwksSettings};
+use crate::auth::layer::{AuthLayer, AuthSettings, Authenticator};
+use crate::clock::system_clock;
+use crate::config::provider::{ConfigProvider, FileProvider};
+use crate::config::{Config, StoreKind};
+use crate::observability::correlation::CorrelationIdLayer;
+use crate::observability::health::{AdminState, ReadinessCheck};
+use crate::observability::metrics::{Metrics, MetricsLayer};
+use crate::observability::tracing::SpanLayer;
+use crate::peer::PeerAddr;
+use crate::proxy::limit::BodyLimitLayer;
+use crate::proxy::scrub::IdentityScrubLayer;
+use crate::proxy::{ProxyClient, ProxyService};
+use crate::ratelimit::layer::RateLimitLayer;
+use crate::ratelimit::limiter::RateLimiter;
+use crate::ratelimit::memory::MemoryStore;
+use crate::ratelimit::redis::RedisStore;
+use crate::ratelimit::store::RateLimitStore;
+use crate::state::{AppState, ServerSettings};
+use crate::{BoxFuture, Request, Response};
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A pilha de processamento, de fora para dentro.
+///
+/// Os cinco primeiros são **globais**: rodam em toda requisição, inclusive nas que
+/// serão rejeitadas com 404 ou 401. É por isso que o scrub de identidade e a
+/// contagem de métricas não podem morar em stacks montadas por rota — elas nunca
+/// veriam a requisição que não casou com rota alguma (D1, D9).
+///
+/// Depois de `route_resolve` vêm os layers **por rota**, que leem o
+/// `RouteRuntime` das extensions e viram no-op quando a rota não pede.
+pub fn gateway_service(
+    state: &AppState,
+) -> impl Service<Request, Response = Response, Error = Infallible, Future: Send> + Clone + Send + 'static
+{
+    ServiceBuilder::new()
+        .layer(CorrelationIdLayer)
+        .layer(IdentityScrubLayer)
+        .layer(SpanLayer)
+        .layer(MetricsLayer::new(state.metrics.clone()))
+        .layer(BodyLimitLayer::new(state.server.max_body_bytes))
+        .layer(crate::routing::layer::RouteResolveLayer::new(
+            state.table.clone(),
+        ))
+        .layer(AuthLayer::new(state.authenticator.clone()))
+        .layer(RateLimitLayer::new(
+            state.limiter.clone(),
+            state.server.trusted_proxies.clone(),
+        ))
+        .service(ProxyService::new(state.proxy.clone()))
+}
+
+/// Monta o `AppState` a partir de uma configuração já validada.
+pub async fn build_state(
+    config: &Config,
+    provider: &FileProvider,
+) -> Result<Arc<AppState>, BoxError> {
+    let clock = system_clock();
+    let metrics = Arc::new(Metrics::new()?);
+    let server = ServerSettings::from_config(config);
+
+    let store: Arc<dyn RateLimitStore> = match config.rate_limit.store {
+        StoreKind::Memory => Arc::new(MemoryStore::new(clock.clone())),
+        StoreKind::Redis => {
+            let url = config
+                .rate_limit
+                .redis_url
+                .as_deref()
+                .expect("validação de startup garante a URL");
+            Arc::new(RedisStore::connect(url, config.rate_limit.redis_timeout).await?)
+        }
+    };
+    tracing::info!(store = store.kind(), "rate limit store pronto");
+
+    let limiter = Arc::new(RateLimiter::new(store, metrics.clone(), clock.clone()));
+
+    let authenticator = match &config.auth {
+        None => None,
+        Some(auth) => {
+            let jwks = Arc::new(JwksCache::new(
+                auth.jwks_url.clone(),
+                JwksSettings {
+                    refresh_interval: auth.refresh_interval,
+                    stale_max_age: auth.stale_max_age,
+                    unknown_kid_cooldown: auth.unknown_kid_cooldown,
+                },
+                clock.clone(),
+            ));
+
+            // Um Auth Service fora no boot não impede o processo de subir: o
+            // gateway sobe reportando `/ready` negativo até a JWKS chegar.
+            if let Err(err) = jwks.refresh().await {
+                tracing::warn!(error = %err, "JWKS indisponível no boot; o gateway sobe não-pronto");
+            }
+            jwks.clone().spawn_refresher();
+
+            Some(Arc::new(Authenticator::new(
+                jwks,
+                AuthSettings {
+                    issuer: auth.issuer.clone(),
+                    audience: auth.audience.clone(),
+                    leeway: auth.leeway,
+                    scope_claim: auth.scope_claim.clone(),
+                },
+            )))
+        }
+    };
+
+    let proxy = Arc::new(ProxyClient::new(
+        server.trusted_proxies.clone(),
+        Some(
+            config
+                .resilience
+                .default
+                .connect_timeout
+                .unwrap_or(crate::config::ResiliencePolicy::default().connect_timeout),
+        ),
+    ));
+
+    Ok(Arc::new(AppState {
+        table: provider.subscribe(),
+        server,
+        authenticator,
+        limiter,
+        proxy,
+        metrics,
+        clock,
+    }))
+}
+
+/// Carrega a configuração, monta o estado e serve até o sinal de desligamento.
+pub async fn run(config_path: impl AsRef<Path>) -> Result<(), BoxError> {
+    let provider = FileProvider::load(config_path.as_ref())?;
+    let config = provider.config().clone();
+
+    let state = build_state(&config, &provider).await?;
+
+    tracing::info!(
+        rotas = state.table().routes().len(),
+        upstreams = config.upstreams.len(),
+        "configuração carregada"
+    );
+
+    let admin = crate::observability::health::router(AdminState {
+        metrics: state.metrics.clone(),
+        readiness: state.clone() as Arc<dyn ReadinessCheck>,
+    });
+
+    let public_listener = TcpListener::bind(config.server.bind).await?;
+    let admin_listener = TcpListener::bind(config.server.admin_bind).await?;
+
+    tracing::info!(
+        publico = %config.server.bind,
+        admin = %config.server.admin_bind,
+        "gateway ouvindo"
+    );
+
+    let public = axum::serve(public_listener, MakeGateway::new(gateway_service(&state)))
+        .with_graceful_shutdown(shutdown_signal());
+    let admin = axum::serve(admin_listener, admin).with_graceful_shutdown(shutdown_signal());
+
+    let (public, admin) = tokio::join!(public, admin);
+    public?;
+    admin?;
+
+    tracing::info!("desligamento concluído");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("sinal recebido, drenando conexões");
+}
+
+/// Make-service que carimba o endereço do peer em cada requisição.
+///
+/// O endereço do socket é a única identidade de rede que o gateway observa
+/// diretamente; tudo o mais sobre o cliente é afirmação de header. `PeerAddr` é a
+/// base do rate limit por IP e do `X-Forwarded-For` de saída.
+#[derive(Debug, Clone)]
+pub struct MakeGateway<S> {
+    inner: S,
+}
+
+impl<S> MakeGateway<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, S> Service<IncomingStream<'a, TcpListener>> for MakeGateway<S>
+where
+    S: Clone,
+{
+    type Response = WithPeer<S>;
+    type Error = Infallible;
+    type Future = std::future::Ready<Result<WithPeer<S>, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, stream: IncomingStream<'a, TcpListener>) -> Self::Future {
+        std::future::ready(Ok(WithPeer {
+            inner: self.inner.clone(),
+            peer: *stream.remote_addr(),
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WithPeer<S> {
+    inner: S,
+    peer: SocketAddr,
+}
+
+impl<S> Service<Request> for WithPeer<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = BoxFuture<Result<Response, Infallible>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request) -> Self::Future {
+        req.extensions_mut().insert(PeerAddr(self.peer));
+
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move { inner.call(req).await })
+    }
+}

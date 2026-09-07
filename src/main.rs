@@ -1,24 +1,24 @@
-use axum::{
-    routing::get,
-    Router,
-};
+//! Bootstrap do processo.
+
+use std::process::ExitCode;
+
+const DEFAULT_CONFIG: &str = "config/gateway.yaml";
 
 #[tokio::main]
-async fn main() {
-    let app = Router::new()
-        .route("/health", get(health));
+async fn main() -> ExitCode {
+    rust_gateway::observability::tracing::init();
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
-        .await
-        .unwrap();
+    let config_path = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("GATEWAY_CONFIG").ok())
+        .unwrap_or_else(|| DEFAULT_CONFIG.to_string());
 
-    println!("Rust Gateway rodando em http://localhost:8080");
-
-    axum::serve(listener, app)
-        .await
-        .unwrap();
-}
-
-async fn health() -> &'static str {
-    "OK"
+    match rust_gateway::server::run(&config_path).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // A configuração inválida chega aqui com a lista inteira de problemas.
+            tracing::error!(config = %config_path, "falha ao subir o gateway:\n{err}");
+            ExitCode::FAILURE
+        }
+    }
 }
