@@ -1,7 +1,8 @@
 //! Métricas Prometheus (spec §11.2).
 //!
-//! Fase 1 expõe o subconjunto mínimo: `gateway_requests_total`,
-//! `gateway_request_duration_seconds` e `gateway_ratelimit_degraded_total`.
+//! Superfície completa: os dois histogramas (`gateway_request_duration_seconds` e
+//! `gateway_upstream_duration_seconds`) respondem "a lentidão é do gateway ou do
+//! upstream?" — a diferença entre eles é o overhead real do gateway.
 //!
 //! **Regra de cardinalidade:** o label de rota é sempre o `route_id` vindo da
 //! configuração, e portanto limitado. Nunca o path bruto — um label de path cru
@@ -11,8 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
+use prometheus::core::{Collector, Desc};
+use prometheus::proto::MetricFamily;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts, Registry, TextEncoder,
+    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use tower::{Layer, Service};
 
@@ -46,12 +50,38 @@ impl Outcome {
     }
 }
 
+/// Fonte dos estados de circuito para o coletor de `gateway_circuit_state`.
+///
+/// Implementada por `BreakerRegistry`. O desacoplamento evita que este módulo
+/// dependa de `resilience` — mesmo padrão de `ReadinessCheck` em
+/// `observability::health`, implementada por `AppState`.
+pub trait CircuitStateSource: Send + Sync {
+    /// `(upstream_id, código do estado)`, código conforme a convenção da spec:
+    /// `0=closed 1=half_open 2=open`.
+    fn circuit_states(&self) -> Vec<(Arc<str>, i64)>;
+}
+
+/// Fonte da idade do cache de JWKS para `gateway_jwks_cache_age_seconds`.
+/// Implementada por `JwksCache`.
+pub trait JwksAgeSource: Send + Sync {
+    /// `None` quando nenhum fetch jamais teve sucesso — nesse caso a métrica não
+    /// é emitida, porque "idade zero" seria lido como "cache fresco", o oposto
+    /// da realidade.
+    fn jwks_age_seconds(&self) -> Option<f64>;
+}
+
 #[derive(Debug)]
 pub struct Metrics {
     registry: Registry,
     requests_total: IntCounterVec,
     request_duration: HistogramVec,
+    upstream_duration: HistogramVec,
+    upstream_inflight: IntGaugeVec,
     ratelimit_degraded: IntCounter,
+    ratelimit_decisions: IntCounterVec,
+    circuit_transitions: IntCounterVec,
+    retries_total: IntCounterVec,
+    auth_failures: IntCounterVec,
 }
 
 impl Metrics {
@@ -74,25 +104,147 @@ impl Metrics {
             &["route"],
         )?;
 
+        let upstream_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "gateway_upstream_duration_seconds",
+                "Duração só da conversa com o upstream, sem o overhead do gateway",
+            ),
+            &["upstream"],
+        )?;
+
+        let upstream_inflight = IntGaugeVec::new(
+            Opts::new(
+                "gateway_upstream_inflight",
+                "Requisições em voo para o upstream neste instante",
+            ),
+            &["upstream"],
+        )?;
+
         let ratelimit_degraded = IntCounter::new(
             "gateway_ratelimit_degraded_total",
             "Requisições liberadas sem decisão de rate limit por indisponibilidade do store",
         )?;
 
+        let ratelimit_decisions = IntCounterVec::new(
+            Opts::new(
+                "gateway_ratelimit_decisions_total",
+                "Decisões de rate limit tomadas pelo store",
+            ),
+            &["route", "key_kind", "decision"],
+        )?;
+
+        let circuit_transitions = IntCounterVec::new(
+            Opts::new(
+                "gateway_circuit_transitions_total",
+                "Transições de estado do circuit breaker, por upstream",
+            ),
+            &["upstream", "to"],
+        )?;
+
+        let retries_total = IntCounterVec::new(
+            Opts::new(
+                "gateway_retries_total",
+                "Tentativas de repetição além da primeira, por rota",
+            ),
+            &["route", "result"],
+        )?;
+
+        let auth_failures = IntCounterVec::new(
+            Opts::new(
+                "gateway_auth_failures_total",
+                "Falhas de autenticação, por motivo",
+            ),
+            &["reason"],
+        )?;
+
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
+        registry.register(Box::new(upstream_duration.clone()))?;
+        registry.register(Box::new(upstream_inflight.clone()))?;
         registry.register(Box::new(ratelimit_degraded.clone()))?;
+        registry.register(Box::new(ratelimit_decisions.clone()))?;
+        registry.register(Box::new(circuit_transitions.clone()))?;
+        registry.register(Box::new(retries_total.clone()))?;
+        registry.register(Box::new(auth_failures.clone()))?;
 
         Ok(Self {
             registry,
             requests_total,
             request_duration,
+            upstream_duration,
+            upstream_inflight,
             ratelimit_degraded,
+            ratelimit_decisions,
+            circuit_transitions,
+            retries_total,
+            auth_failures,
         })
     }
 
     pub fn ratelimit_degraded(&self) {
         self.ratelimit_degraded.inc();
+    }
+
+    pub fn record_ratelimit_decision(&self, route: &str, key_kind: &str, allowed: bool) {
+        let decision = if allowed { "allowed" } else { "rejected" };
+        self.ratelimit_decisions
+            .with_label_values(&[route, key_kind, decision])
+            .inc();
+    }
+
+    /// Chamada pelo `CircuitBreaker` a cada transição real de estado (não a cada
+    /// avaliação — `transition()` já filtra o caso "mudou para o mesmo estado").
+    pub fn record_circuit_transition(&self, upstream: &str, to: &str) {
+        self.circuit_transitions
+            .with_label_values(&[upstream, to])
+            .inc();
+    }
+
+    /// Uma tentativa além da primeira. `result` é `"success"` quando essa
+    /// tentativa específica teve sucesso, `"failure"` quando também falhou —
+    /// múltiplas falhas na mesma requisição incrementam múltiplas vezes, o que é
+    /// o ponto: o contador mede tentativas gastas, não requisições.
+    pub fn record_retry(&self, route: &str, result: &str) {
+        self.retries_total.with_label_values(&[route, result]).inc();
+    }
+
+    pub fn record_auth_failure(&self, reason: &str) {
+        self.auth_failures.with_label_values(&[reason]).inc();
+    }
+
+    pub fn observe_upstream_duration(&self, upstream: &str, secs: f64) {
+        self.upstream_duration
+            .with_label_values(&[upstream])
+            .observe(secs);
+    }
+
+    /// Marca uma requisição como em voo para `upstream`. O guarda decrementa
+    /// sozinho quando sai de escopo — inclusive no caminho de erro, sem exigir
+    /// que cada `return` intermediário lembre de decrementar.
+    pub fn track_upstream_inflight(&self, upstream: &str) -> InflightGuard {
+        let gauge = self.upstream_inflight.with_label_values(&[upstream]);
+        gauge.inc();
+        InflightGuard(gauge)
+    }
+
+    /// Registra o coletor de `gateway_circuit_state`. Chamado uma vez no
+    /// bootstrap, com o `BreakerRegistry` já construído.
+    pub fn register_circuit_states(
+        &self,
+        source: Arc<dyn CircuitStateSource>,
+    ) -> Result<(), prometheus::Error> {
+        self.registry
+            .register(Box::new(CircuitStateCollector::new(source)?))
+    }
+
+    /// Registra o coletor de `gateway_jwks_cache_age_seconds`. Só faz sentido
+    /// chamar quando há autenticação configurada — sem `auth`, não há cache.
+    pub fn register_jwks_age(
+        &self,
+        source: Arc<dyn JwksAgeSource>,
+    ) -> Result<(), prometheus::Error> {
+        self.registry
+            .register(Box::new(JwksAgeCollector::new(source)?))
     }
 
     pub fn render(&self) -> String {
@@ -109,6 +261,86 @@ impl Metrics {
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+}
+
+/// RAII para `gateway_upstream_inflight`. Decrementa no `Drop`, então cobre
+/// tanto a resposta bem-sucedida quanto o erro de conexão sem duplicar lógica.
+pub struct InflightGuard(prometheus::IntGauge);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// Coletor de `gateway_circuit_state`, computado a cada scrape.
+///
+/// Um circuito recém-criado (upstream que ainda não recebeu tráfego) não tem
+/// entrada no registro de breakers, e portanto não aparece até a primeira
+/// requisição — não há "estado padrão" a inventar para um upstream ocioso.
+struct CircuitStateCollector {
+    gauge: GaugeVec,
+    source: Arc<dyn CircuitStateSource>,
+}
+
+impl CircuitStateCollector {
+    fn new(source: Arc<dyn CircuitStateSource>) -> Result<Self, prometheus::Error> {
+        let gauge = GaugeVec::new(
+            Opts::new(
+                "gateway_circuit_state",
+                "Estado do circuit breaker por upstream (0=closed 1=half_open 2=open)",
+            ),
+            &["upstream"],
+        )?;
+        Ok(Self { gauge, source })
+    }
+}
+
+impl Collector for CircuitStateCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        for (upstream, code) in self.source.circuit_states() {
+            self.gauge.with_label_values(&[&upstream]).set(code as f64);
+        }
+        self.gauge.collect()
+    }
+}
+
+/// Coletor de `gateway_jwks_cache_age_seconds`, computado a cada scrape.
+struct JwksAgeCollector {
+    gauge: prometheus::Gauge,
+    source: Arc<dyn JwksAgeSource>,
+}
+
+impl JwksAgeCollector {
+    fn new(source: Arc<dyn JwksAgeSource>) -> Result<Self, prometheus::Error> {
+        let gauge = prometheus::Gauge::new(
+            "gateway_jwks_cache_age_seconds",
+            "Idade do snapshot corrente de JWKS, em segundos desde o último fetch bem-sucedido",
+        )?;
+        Ok(Self { gauge, source })
+    }
+}
+
+impl Collector for JwksAgeCollector {
+    fn desc(&self) -> Vec<&Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<MetricFamily> {
+        match self.source.jwks_age_seconds() {
+            Some(age) => {
+                self.gauge.set(age);
+                self.gauge.collect()
+            }
+            // Sem fetch bem-sucedido ainda: nenhuma amostra, em vez de uma
+            // idade inventada.
+            None => Vec::new(),
+        }
     }
 }
 
@@ -240,7 +472,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_expoe_o_subconjunto_minimo_da_fase_1() {
+    fn render_expoe_o_subconjunto_da_fase_1() {
         let metrics = Metrics::new().unwrap();
         metrics.ratelimit_degraded();
         metrics
@@ -257,6 +489,103 @@ mod tests {
         assert!(rendered.contains("gateway_request_duration_seconds"));
         assert!(rendered.contains("gateway_ratelimit_degraded_total 1"));
         assert!(rendered.contains(r#"route="users""#));
+    }
+
+    #[test]
+    fn render_expoe_a_superficie_da_fase_3() {
+        let metrics = Metrics::new().unwrap();
+
+        metrics.observe_upstream_duration("user-service", 0.02);
+        metrics.record_ratelimit_decision("users", "ip", true);
+        metrics.record_ratelimit_decision("users", "ip", false);
+        metrics.record_circuit_transition("user-service", "open");
+        metrics.record_retry("orders", "success");
+        metrics.record_auth_failure("expired");
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("gateway_upstream_duration_seconds"));
+        assert!(rendered.contains(
+            r#"gateway_ratelimit_decisions_total{decision="allowed",key_kind="ip",route="users"} 1"#
+        ));
+        assert!(rendered.contains(r#"gateway_ratelimit_decisions_total{decision="rejected",key_kind="ip",route="users"} 1"#));
+        assert!(
+            rendered.contains(
+                r#"gateway_circuit_transitions_total{to="open",upstream="user-service"} 1"#
+            )
+        );
+        assert!(rendered.contains(r#"gateway_retries_total{result="success",route="orders"} 1"#));
+        assert!(rendered.contains(r#"gateway_auth_failures_total{reason="expired"} 1"#));
+    }
+
+    #[test]
+    fn inflight_guard_incrementa_na_criacao_e_decrementa_ao_sair_de_escopo() {
+        let metrics = Metrics::new().unwrap();
+
+        {
+            let _guard = metrics.track_upstream_inflight("user-service");
+            assert!(
+                metrics
+                    .render()
+                    .contains(r#"gateway_upstream_inflight{upstream="user-service"} 1"#)
+            );
+        }
+
+        assert!(
+            metrics
+                .render()
+                .contains(r#"gateway_upstream_inflight{upstream="user-service"} 0"#)
+        );
+    }
+
+    struct FakeCircuitStates(Vec<(Arc<str>, i64)>);
+    impl CircuitStateSource for FakeCircuitStates {
+        fn circuit_states(&self) -> Vec<(Arc<str>, i64)> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn circuit_state_e_computado_a_cada_scrape() {
+        let metrics = Metrics::new().unwrap();
+        let source = Arc::new(FakeCircuitStates(vec![("user-service".into(), 2)]));
+        metrics.register_circuit_states(source).unwrap();
+
+        assert!(
+            metrics
+                .render()
+                .contains(r#"gateway_circuit_state{upstream="user-service"} 2"#)
+        );
+    }
+
+    struct FakeJwksAge(Option<f64>);
+    impl JwksAgeSource for FakeJwksAge {
+        fn jwks_age_seconds(&self) -> Option<f64> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn jwks_age_ausente_nao_emite_a_metrica() {
+        let metrics = Metrics::new().unwrap();
+        metrics
+            .register_jwks_age(Arc::new(FakeJwksAge(None)))
+            .unwrap();
+
+        assert!(!metrics.render().contains("gateway_jwks_cache_age_seconds"));
+    }
+
+    #[test]
+    fn jwks_age_presente_emite_a_metrica() {
+        let metrics = Metrics::new().unwrap();
+        metrics
+            .register_jwks_age(Arc::new(FakeJwksAge(Some(12.5))))
+            .unwrap();
+
+        assert!(
+            metrics
+                .render()
+                .contains("gateway_jwks_cache_age_seconds 12.5")
+        );
     }
 
     #[test]
