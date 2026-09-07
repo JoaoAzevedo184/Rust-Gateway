@@ -12,7 +12,7 @@ use crate::auth::claims::{Claims, granted_scopes, validation};
 use crate::auth::jwks::JwksCache;
 use crate::auth::{AuthFailure, Identity};
 use crate::error::GatewayError;
-use crate::observability::metrics::{self, Outcome};
+use crate::observability::metrics::{self, Metrics, Outcome};
 use crate::observability::tracing::record_sub;
 use crate::routing::layer::route_of;
 use crate::{BoxFuture, Request, Response};
@@ -87,13 +87,17 @@ impl std::fmt::Debug for Authenticator {
 #[derive(Debug, Clone)]
 pub struct AuthLayer {
     authenticator: Option<Arc<Authenticator>>,
+    metrics: Arc<Metrics>,
 }
 
 impl AuthLayer {
     /// `None` quando não há seção `auth` configurada. A validação de startup já
     /// garantiu que, nesse caso, nenhuma rota exige autenticação.
-    pub fn new(authenticator: Option<Arc<Authenticator>>) -> Self {
-        Self { authenticator }
+    pub fn new(authenticator: Option<Arc<Authenticator>>, metrics: Arc<Metrics>) -> Self {
+        Self {
+            authenticator,
+            metrics,
+        }
     }
 }
 
@@ -104,6 +108,7 @@ impl<S> Layer<S> for AuthLayer {
         AuthService {
             inner,
             authenticator: self.authenticator.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -112,6 +117,7 @@ impl<S> Layer<S> for AuthLayer {
 pub struct AuthService<S> {
     inner: S,
     authenticator: Option<Arc<Authenticator>>,
+    metrics: Arc<Metrics>,
 }
 
 impl<S> Service<Request> for AuthService<S>
@@ -138,6 +144,7 @@ where
 
         let token = bearer_token(req.headers());
         let authenticator = self.authenticator.clone();
+        let metrics = self.metrics.clone();
 
         Box::pin(async move {
             let outcome = match (token, &authenticator) {
@@ -158,6 +165,7 @@ where
                 // Um token presente e inválido é sempre rejeitado, mesmo em rota
                 // anônima: a rota dispensa credencial, não perdoa credencial ruim.
                 Some(Err(failure)) => {
+                    metrics.record_auth_failure(failure.reason());
                     let error = match &failure {
                         AuthFailure::JwksUnavailable => {
                             metrics::mark(req.extensions(), Outcome::RejectedAuth);
@@ -181,6 +189,7 @@ where
                     let missing = route.auth.missing_scopes(&identity.scopes);
                     tracing::debug!(sub = %identity.sub, ?missing, "escopo insuficiente");
                     metrics::mark(req.extensions(), Outcome::RejectedAuth);
+                    metrics.record_auth_failure("insufficient_scope");
                     return Ok(GatewayError::forbidden(
                         "Token lacks the scopes required by this route",
                     )

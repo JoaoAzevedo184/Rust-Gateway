@@ -113,6 +113,12 @@ impl JwksCache {
         ))
     }
 
+    /// Idade do cache, para o coletor de `gateway_jwks_cache_age_seconds`.
+    /// Fração de segundo preservada, não arredondada.
+    fn age_seconds(&self) -> Option<f64> {
+        self.age().map(|age| age.as_secs_f64())
+    }
+
     /// Um snapshot é utilizável enquanto estiver dentro de `stale_max_age`.
     ///
     /// Com o refresh falhando, o snapshot anterior continua válido: é o que faz um
@@ -279,6 +285,12 @@ fn algorithm_of(jwk: &Jwk) -> Option<Algorithm> {
 
 fn is_asymmetric(alg: &Algorithm) -> bool {
     !matches!(alg, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512)
+}
+
+impl crate::observability::metrics::JwksAgeSource for JwksCache {
+    fn jwks_age_seconds(&self) -> Option<f64> {
+        self.age_seconds()
+    }
 }
 
 #[cfg(test)]
