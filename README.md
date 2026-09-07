@@ -17,18 +17,19 @@ exposto.
 
 ## Estado
 
-**Fase 1 implementada.** O gateway roteia, autentica, limita taxa e encaminha, com
-Docker Compose subindo o ambiente completo.
+**Fases 1 e 2 implementadas.** O gateway roteia, autentica, limita taxa, encaminha
+e se protege de upstreams doentes, com Docker Compose subindo o ambiente completo.
 
 | Fase | Conteúdo | Estado |
 |---|---|---|
 | 1 — núcleo | Configuração, roteamento, proxy, JWT/JWKS, rate limiting, health/ready | Implementada |
-| 2 — resiliência | Timeouts, retry, circuit breaker | Especificada |
-| 3 — observabilidade | Métricas completas, OpenTelemetry, benchmarks | Especificada |
+| 2 — resiliência | Três timeouts, retry, circuit breaker | Implementada |
+| 3 — observabilidade | Superfície completa de métricas, OpenTelemetry, benchmarks | Especificada |
 
-Da Fase 2, só `connect_timeout` está em vigor. `upstream_timeout`,
-`request_timeout`, retry e circuit breaker são lidos e validados na configuração,
-mas ainda não aplicados no caminho da requisição.
+A Fase 3 acrescenta as famílias de métrica que faltam — `gateway_circuit_state`,
+`gateway_retries_total`, `gateway_upstream_duration_seconds` — e a propagação de
+`traceparent` W3C. Até lá, o circuit breaker é observável pelo label
+`outcome="circuit_open"` e pelas transições no log.
 
 ## O que o gateway faz
 
@@ -38,8 +39,8 @@ mas ainda não aplicados no caminho da requisição.
   Auth Service.
 - **Rate limiting** token bucket, por `sub` em rotas autenticadas e por IP em rotas
   anônimas, com estado compartilhado no Redis para múltiplas réplicas.
-- **Resiliência** (Fase 2): três níveis de timeout, retry restrito a métodos idempotentes
-  e falhas pré-resposta, circuit breaker por upstream.
+- **Resiliência**: três níveis de timeout, retry restrito a métodos idempotentes e a
+  falhas pré-resposta, circuit breaker por upstream com janela deslizante.
 - **Observabilidade**: correlation ID, logs JSON estruturados e métricas Prometheus.
   Propagação de contexto de trace W3C na Fase 3.
 
@@ -92,19 +93,15 @@ Rust · Tokio · Hyper · Axum · Tower · Redis · Prometheus · OpenTelemetry 
 
 A documentação segue o [Diátaxis](https://diataxis.fr/) e vive em [`docs/`](docs/).
 
-O quadrante **Explanation** está escrito e explica o racional de cada decisão:
-
-- [Arquitetura](docs/explanation/architecture.md) — a pilha de layers, o que é global e o
-  que é por rota, onde vive o estado.
-- [Modelo de autenticação](docs/explanation/authentication-model.md) — a fronteira entre
-  Auth Service, gateway e backend.
-- [Rate limiting](docs/explanation/rate-limiting.md) — por que token bucket, e por que
-  falha aberto.
-- [Resiliência](docs/explanation/resilience.md) — a ordem entre retry e circuit breaker.
-- [Observabilidade](docs/explanation/observability.md) — liveness contra readiness, e a
-  regra de cardinalidade.
-
-Reference, How-to e Tutorial são escritos junto com a Fase 1, verificados contra o binário.
+- **[Tutorial](docs/tutorial/)** — do clone ao primeiro request autenticado, em quinze
+  minutos. Comece por aqui.
+- **[How-to](docs/how-to/)** — adicionar uma rota, proteger com escopos, subir réplicas,
+  ajustar resiliência, investigar um 429 ou um 502.
+- **[Reference](docs/reference/)** — todo campo de configuração, código de erro, header e
+  métrica.
+- **[Explanation](docs/explanation/)** — por que cada decisão foi tomada: a ordem dos
+  layers, a fronteira de autenticação, por que o rate limit falha aberto, por que o
+  breaker fica dentro do retry.
 
 ## Como rodar
 
@@ -134,7 +131,7 @@ Sem Docker, com um toolchain Rust 1.85 ou mais novo:
 
 ```bash
 cargo run -- config/gateway.yaml              # o caminho da config é o argumento
-cargo test                                    # 88 testes
+cargo test                                    # 118 testes
 REDIS_URL=redis://127.0.0.1:6379 cargo test   # inclui a conformance do store Redis
 ```
 
