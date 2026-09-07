@@ -4,5 +4,44 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# HTTP / runtime
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util", "make"] }
+tower-service = "0.3"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
+
+# Configuração
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+humantime-serde = "1"
+ipnet = { version = "2", features = ["serde"] }
+
+# Autenticação
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+arc-swap = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "json"] }
+
+# Rate limiting
+redis = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
+
+# Observabilidade
+prometheus = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v7"] }
+
+# Utilitários
+async-trait = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+base64 = "0.23.1"
+tempfile = "3"
