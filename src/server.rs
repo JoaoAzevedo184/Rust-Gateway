@@ -14,7 +14,7 @@ use crate::auth::jwks::{JwksCache, JwksSettings};
 use crate::auth::layer::{AuthLayer, AuthSettings, Authenticator};
 use crate::clock::system_clock;
 use crate::config::provider::{ConfigProvider, FileProvider};
-use crate::config::{Config, StoreKind};
+use crate::config::{Config, ConfigError, StoreKind};
 use crate::observability::correlation::CorrelationIdLayer;
 use crate::observability::health::{AdminState, ReadinessCheck};
 use crate::observability::metrics::{Metrics, MetricsLayer};
@@ -68,15 +68,25 @@ pub fn gateway_service(
         .layer(crate::routing::layer::RouteResolveLayer::new(
             state.table.clone(),
         ))
-        .layer(AuthLayer::new(state.authenticator.clone()))
+        .layer(AuthLayer::new(
+            state.authenticator.clone(),
+            state.metrics.clone(),
+        ))
         .layer(RateLimitLayer::new(
             state.limiter.clone(),
             state.server.trusted_proxies.clone(),
+            state.metrics.clone(),
         ))
-        .layer(RetryLayer::new(state.server.max_body_bytes))
+        .layer(RetryLayer::new(
+            state.server.max_body_bytes,
+            state.metrics.clone(),
+        ))
         .layer(CircuitBreakerLayer::new(state.breakers.clone()))
         .layer(UpstreamTimeoutLayer)
-        .service(ProxyService::new(state.proxy.clone()))
+        .service(ProxyService::new(
+            state.proxy.clone(),
+            state.metrics.clone(),
+        ))
 }
 
 /// Monta o `AppState` a partir de uma configuração já validada.
@@ -123,6 +133,10 @@ pub async fn build_state(
             }
             jwks.clone().spawn_refresher();
 
+            if let Err(err) = metrics.register_jwks_age(jwks.clone()) {
+                tracing::warn!(error = %err, "não foi possível registrar gateway_jwks_cache_age_seconds");
+            }
+
             Some(Arc::new(Authenticator::new(
                 jwks,
                 AuthSettings {
@@ -135,23 +149,37 @@ pub async fn build_state(
         }
     };
 
+    // Um cliente por `connect_timeout` distinto entre os upstreams configurados —
+    // o mesmo cálculo que `RouterTable::build` usa para resolver
+    // `UpstreamRuntime.resilience`, replicado aqui porque o proxy precisa do
+    // conjunto de valores antes de qualquer requisição, não de um upstream por vez.
+    let connect_timeouts: std::collections::BTreeSet<std::time::Duration> = config
+        .upstreams
+        .values()
+        .map(|upstream| {
+            crate::config::ResiliencePolicy::default()
+                .with(Some(&config.resilience.default))
+                .with(upstream.resilience.as_ref())
+                .connect_timeout
+        })
+        .collect();
+
     let proxy = Arc::new(ProxyClient::new(
         server.trusted_proxies.clone(),
-        Some(
-            config
-                .resilience
-                .default
-                .connect_timeout
-                .unwrap_or(crate::config::ResiliencePolicy::default().connect_timeout),
-        ),
+        connect_timeouts,
     ));
+
+    let breakers = Arc::new(BreakerRegistry::new(clock.clone(), metrics.clone()));
+    if let Err(err) = metrics.register_circuit_states(breakers.clone()) {
+        tracing::warn!(error = %err, "não foi possível registrar gateway_circuit_state");
+    }
 
     Ok(Arc::new(AppState {
         table: provider.subscribe(),
         server,
         authenticator,
         limiter,
-        breakers: Arc::new(BreakerRegistry::new(clock.clone())),
+        breakers,
         proxy,
         metrics,
         clock,
@@ -160,7 +188,33 @@ pub async fn build_state(
 
 /// Carrega a configuração, monta o estado e serve até o sinal de desligamento.
 pub async fn run(config_path: impl AsRef<Path>) -> Result<(), BoxError> {
-    let provider = FileProvider::load(config_path.as_ref())?;
+    let load_result = FileProvider::load(config_path.as_ref());
+
+    // A inicialização do tracing precisa acontecer antes de qualquer log, e
+    // portanto antes do `?` que propagaria uma config inválida — senão o erro
+    // mais informativo que o gateway produz (a lista de problemas de validação)
+    // sairia sem log algum. `otlp_endpoint` só existe quando a config carregou.
+    let otlp_endpoint = load_result
+        .as_ref()
+        .ok()
+        .and_then(|provider| provider.config().tracing.as_ref())
+        .map(|tracing| tracing.otlp_endpoint.clone());
+
+    let tracer_provider = crate::observability::tracing::init(otlp_endpoint.as_deref());
+
+    let result = run_gateway(load_result).await;
+
+    // Encerra o exportador OTLP com o processo, para que spans ainda em lote no
+    // momento do sinal de desligamento cheguem ao coletor em vez de se perderem.
+    if let Err(err) = tracer_provider.shutdown() {
+        tracing::warn!(error = %err, "falha ao encerrar o exportador de tracing");
+    }
+
+    result
+}
+
+async fn run_gateway(load_result: Result<FileProvider, ConfigError>) -> Result<(), BoxError> {
+    let provider = load_result?;
     let config = provider.config().clone();
 
     let state = build_state(&config, &provider).await?;

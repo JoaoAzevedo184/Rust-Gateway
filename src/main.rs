@@ -6,8 +6,6 @@ const DEFAULT_CONFIG: &str = "config/gateway.yaml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    rust_gateway::observability::tracing::init();
-
     let config_path = std::env::args()
         .nth(1)
         .or_else(|| std::env::var("GATEWAY_CONFIG").ok())
