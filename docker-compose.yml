@@ -1,0 +1,56 @@
+# Ambiente inicial: gateway, Redis e upstreams stub.
+#
+# Só a porta pública do gateway é publicada. A porta administrativa (9090) fica
+# na rede interna de propósito — /metrics e /ready não passam pela pilha de
+# políticas, e não deveriam estar expostos. Para consultá-los de dentro da rede:
+#
+#   docker compose run --rm --entrypoint sh redis -c 'wget -qO- http://gateway:9090/metrics'
+#   docker compose run --rm --entrypoint sh redis -c 'wget -qO- http://gateway:9090/ready'
+#
+# Os upstreams são `traefik/whoami`, que responde ecoando os headers recebidos —
+# conveniente para ver o que o gateway injetou e o que removeu.
+
+services:
+  gateway:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config/gateway.yaml:/etc/rust-gateway/gateway.yaml:ro
+    environment:
+      RUST_LOG: "info,rust_gateway=info"
+    depends_on:
+      redis:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: unless-stopped
+
+  user-service:
+    image: traefik/whoami
+    command: ["--name", "user-service"]
+    restart: unless-stopped
+
+  order-service:
+    image: traefik/whoami
+    command: ["--name", "order-service"]
+    restart: unless-stopped
+
+  payment-service:
+    image: traefik/whoami
+    command: ["--name", "payment-service"]
+    restart: unless-stopped
