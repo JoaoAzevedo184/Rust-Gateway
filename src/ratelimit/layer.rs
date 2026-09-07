@@ -9,7 +9,7 @@ use tower::{Layer, Service};
 use crate::auth::Identity;
 use crate::config::KeyKind;
 use crate::error::GatewayError;
-use crate::observability::metrics::{self, Outcome};
+use crate::observability::metrics::{self, Metrics, Outcome};
 use crate::peer::{PeerAddr, TrustedProxies};
 use crate::ratelimit::limiter::RateLimiter;
 use crate::ratelimit::store::{BucketRequest, Decision, bucket_key};
@@ -21,11 +21,16 @@ use crate::{BoxFuture, Request, Response};
 pub struct RateLimitLayer {
     limiter: Arc<RateLimiter>,
     trusted: TrustedProxies,
+    metrics: Arc<Metrics>,
 }
 
 impl RateLimitLayer {
-    pub fn new(limiter: Arc<RateLimiter>, trusted: TrustedProxies) -> Self {
-        Self { limiter, trusted }
+    pub fn new(limiter: Arc<RateLimiter>, trusted: TrustedProxies, metrics: Arc<Metrics>) -> Self {
+        Self {
+            limiter,
+            trusted,
+            metrics,
+        }
     }
 }
 
@@ -37,6 +42,7 @@ impl<S> Layer<S> for RateLimitLayer {
             inner,
             limiter: self.limiter.clone(),
             trusted: self.trusted.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -46,6 +52,7 @@ pub struct RateLimitService<S> {
     inner: S,
     limiter: Arc<RateLimiter>,
     trusted: TrustedProxies,
+    metrics: Arc<Metrics>,
 }
 
 impl<S> Service<Request> for RateLimitService<S>
@@ -65,7 +72,8 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        let buckets = match route_of(req.extensions()) {
+        let route = route_of(req.extensions()).cloned();
+        let buckets = match &route {
             Some(route) if !route.limits.is_empty() => {
                 build_buckets(route, req.extensions(), req.headers(), &self.trusted)
             }
@@ -77,6 +85,9 @@ where
         }
 
         let limiter = self.limiter.clone();
+        let metrics = self.metrics.clone();
+        // A rota existe: `buckets` só é não-vazio quando `route_of` casou acima.
+        let route_id = route.expect("rota presente quando há buckets").id.clone();
 
         Box::pin(async move {
             let Some(decision) = limiter.check(&buckets).await else {
@@ -84,6 +95,14 @@ where
                 // número honesto para anunciar.
                 return inner.call(req).await;
             };
+
+            // Todos os buckets da rota se avaliam juntos (tudo-ou-nada), então o
+            // desfecho é o mesmo para cada `key_kind` presente — mas o label
+            // continua separado por kind, para diferenciar "quantas decisões
+            // envolveram sub" de "quantas envolveram ip".
+            for kind in distinct_kinds(&buckets) {
+                metrics.record_ratelimit_decision(&route_id, kind, decision.allowed);
+            }
 
             if !decision.allowed {
                 metrics::mark(req.extensions(), Outcome::RejectedRateLimit);
@@ -98,6 +117,20 @@ where
             Ok(response)
         })
     }
+}
+
+/// `key_kind`s distintos entre os buckets da rota, sem repetir. A lista é
+/// sempre pequena (um ou dois limites por rota), então uma varredura linear é
+/// mais simples e tão barata quanto um `HashSet` aqui.
+fn distinct_kinds(buckets: &[BucketRequest]) -> Vec<&'static str> {
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for bucket in buckets {
+        let kind = bucket.kind.as_str();
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
 }
 
 /// Monta um `BucketRequest` por limite configurado na rota.

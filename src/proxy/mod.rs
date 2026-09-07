@@ -19,7 +19,7 @@ use hyper_util::rt::TokioExecutor;
 use tower::Service;
 
 use crate::error::GatewayError;
-use crate::observability::metrics::{self, Outcome};
+use crate::observability::metrics::{self, Metrics, Outcome};
 use crate::peer::{PeerAddr, TrustedProxies};
 use crate::resilience::AttemptOutcome;
 use crate::routing::layer::route_of;
@@ -115,11 +115,12 @@ fn build_client(connect_timeout: Option<Duration>) -> HttpClient {
 #[derive(Debug, Clone)]
 pub struct ProxyService {
     client: Arc<ProxyClient>,
+    metrics: Arc<Metrics>,
 }
 
 impl ProxyService {
-    pub fn new(client: Arc<ProxyClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<ProxyClient>, metrics: Arc<Metrics>) -> Self {
+        Self { client, metrics }
     }
 }
 
@@ -134,6 +135,7 @@ impl Service<Request> for ProxyService {
 
     fn call(&mut self, mut req: Request) -> Self::Future {
         let client = self.client.clone();
+        let metrics = self.metrics.clone();
 
         let Some(route) = route_of(req.extensions()).cloned() else {
             // Inalcançável: `route_resolve` responde 404 antes de chegar aqui.
@@ -174,7 +176,16 @@ impl Service<Request> for ProxyService {
         Box::pin(async move {
             let upstream_id = route.upstream.id.clone();
 
-            match client.client_for(connect_timeout).request(req).await {
+            // O gauge cobre a chamada inteira, inclusive o caminho de erro; o
+            // histograma mede só a chamada, não o resto do processamento do
+            // gateway — é o que responde "a lentidão é do gateway ou do upstream?"
+            let _inflight = metrics.track_upstream_inflight(&upstream_id);
+            let started = std::time::Instant::now();
+
+            let result = client.client_for(connect_timeout).request(req).await;
+            metrics.observe_upstream_duration(&upstream_id, started.elapsed().as_secs_f64());
+
+            match result {
                 Ok(upstream) => {
                     let (mut parts, body) = upstream.into_parts();
                     strip_hop_by_hop(&mut parts.headers);

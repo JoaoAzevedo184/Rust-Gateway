@@ -51,6 +51,10 @@ pub struct Config {
     pub upstreams: BTreeMap<String, UpstreamConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Ausente = sem exportação OTLP. Propagação de `traceparent` acontece de
+    /// qualquer forma; esta seção só liga o destino dos spans.
+    #[serde(default)]
+    pub tracing: Option<TracingConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +87,14 @@ impl Default for ServerConfig {
             trusted_proxies: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TracingConfig {
+    /// URL do coletor OTLP, protocolo HTTP/protobuf (`/v1/traces` incluso ou não,
+    /// conforme o coletor). Ausente desliga a exportação.
+    pub otlp_endpoint: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -381,6 +393,12 @@ impl Config {
 
         if self.rate_limit.store == StoreKind::Redis && self.rate_limit.redis_url.is_none() {
             problems.push("rate_limit.store: redis exige rate_limit.redis_url".into());
+        }
+
+        if let Some(tracing) = &self.tracing
+            && let Err(err) = validate_absolute_url(&tracing.otlp_endpoint)
+        {
+            problems.push(format!("tracing.otlp_endpoint {err}"));
         }
 
         for (id, upstream) in &self.upstreams {
@@ -747,6 +765,21 @@ routes:
                 .any(|p| p.contains("upstreams.user-service.url")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn otlp_endpoint_malformado_e_erro_de_startup() {
+        let yaml = format!("tracing:\n  otlp_endpoint: \"nao-e-url\"\n{MINIMO}");
+        let problems = erros(&yaml);
+        assert!(
+            problems.iter().any(|p| p.contains("tracing.otlp_endpoint")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn otlp_endpoint_ausente_nao_e_erro() {
+        Config::parse(MINIMO, "teste").expect("tracing é opcional");
     }
 
     #[test]
