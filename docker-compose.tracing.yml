@@ -1,0 +1,26 @@
+# Sobreposição que liga a exportação de traces, para ver um trace de verdade.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tracing.yml up --build
+#
+# Acrescenta um Jaeger com o receptor OTLP/HTTP ligado, e troca a configuração
+# do gateway por uma com `tracing.otlp_endpoint` apontando para ele. A UI do
+# Jaeger fica em http://localhost:16686.
+#
+# A propagação de traceparent funciona com ou sem este overlay — ele só liga o
+# destino dos spans.
+
+services:
+  gateway:
+    volumes: !override
+      - ./config/gateway.tracing.yaml:/etc/rust-gateway/gateway.yaml:ro
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686" # UI
+    restart: unless-stopped
