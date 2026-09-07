@@ -28,11 +28,14 @@ rate_limit:
   redis_timeout: 50ms
 
 # Herdada na ordem: default -> upstreams.<id>.resilience -> routes[].resilience,
-# campo a campo. Fase 1 aplica apenas connect_timeout; o resto entra na Fase 2.
+# campo a campo. circuit_breaker é a exceção: só vale em default ou no upstream,
+# porque o estado do circuito é por upstream.
 resilience:
   default:
-    connect_timeout: 2s
-    upstream_timeout: 5s
+    connect_timeout: 2s                # estabelecer a conexão TCP
+    upstream_timeout: 5s               # uma tentativa
+    # max_attempts conta a primeira tentativa: 2 = uma repetição, 0 = nenhuma.
+    # Só métodos idempotentes e falhas pré-resposta são repetidos, sempre.
     retry: { max_attempts: 2, backoff: 50ms, jitter: true }
     circuit_breaker:
       failure_ratio: 0.5

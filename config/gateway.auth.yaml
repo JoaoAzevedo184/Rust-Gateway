@@ -1,0 +1,58 @@
+# Configuração com autenticação ligada, usada por docker-compose.auth.yml.
+#
+# O Auth Service é o nginx de desenvolvimento que serve a JWKS gerada por
+# ./scripts/dev-auth.sh. O issuer e a audience aqui precisam bater com os que o
+# script coloca nos tokens.
+
+server:
+  bind: 0.0.0.0:8080
+  admin_bind: 0.0.0.0:9090
+  max_body_bytes: 2MiB
+  trusted_proxies: []
+
+auth:
+  jwks_url: http://auth-service/.well-known/jwks.json
+  issuer: https://auth.dev.local
+  audience: rust-gateway
+
+rate_limit:
+  store: redis
+  redis_url: redis://redis:6379
+  redis_timeout: 50ms
+
+upstreams:
+  user-service: { url: http://user-service:80 }
+  order-service: { url: http://order-service:80 }
+  payment-service: { url: http://payment-service:80 }
+
+routes:
+  # Autenticada: exige token válido e o scope user.read.
+  - id: users
+    match: { prefix: /users }
+    upstream: user-service
+    auth: { required: true, scopes: [user.read] }
+    rate_limit:
+      - { key: sub, capacity: 600, refill_per_sec: 10 }
+
+  # Anônima, e mais específica: cadastro não pode exigir o token que ainda não existe.
+  - id: users-signup
+    match: { prefix: /users/signup }
+    upstream: user-service
+    auth: { required: false }
+    rate_limit:
+      - { key: ip, capacity: 5, refill_per_sec: 0.1 }
+
+  - id: orders
+    match: { prefix: /orders }
+    upstream: order-service
+    strip_prefix: true
+    auth: { required: true, scopes: [order.read] }
+    rate_limit:
+      - { key: sub, capacity: 300, refill_per_sec: 5 }
+
+  - id: payments
+    match: { prefix: /payments }
+    upstream: payment-service
+    auth: { required: true, scopes: [payment.write] }
+    rate_limit:
+      - { key: sub, capacity: 30, refill_per_sec: 0.5 }

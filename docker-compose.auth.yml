@@ -1,0 +1,23 @@
+# Sobreposição que liga a autenticação, para percorrer o tutorial.
+#
+#   ./scripts/dev-auth.sh init
+#   docker compose -f docker-compose.yml -f docker-compose.auth.yml up --build
+#
+# Acrescenta um Auth Service de desenvolvimento — um nginx servindo a JWKS gerada
+# pelo script — e troca a configuração do gateway por uma com rotas autenticadas.
+
+services:
+  gateway:
+    volumes: !override
+      - ./config/gateway.auth.yaml:/etc/rust-gateway/gateway.yaml:ro
+    depends_on:
+      auth-service:
+        condition: service_started
+
+  auth-service:
+    image: nginx:alpine
+    # Apenas a JWKS é montada. A chave privada fica de fora de propósito: um
+    # Auth Service publica a chave pública, nunca a que assina.
+    volumes:
+      - ./.dev-auth/jwks.json:/usr/share/nginx/html/.well-known/jwks.json:ro
+    restart: unless-stopped
