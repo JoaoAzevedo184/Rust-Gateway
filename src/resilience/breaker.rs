@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::clock::Clock;
 use crate::config::BreakerPolicy;
+use crate::observability::metrics::Metrics;
 
 /// Divisões da janela deslizante. Mais divisões dão uma janela mais suave ao
 /// custo de memória; dez é o suficiente para que o descarte do passado não
@@ -29,6 +30,17 @@ impl CircuitState {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
             CircuitState::HalfOpen => "half_open",
+        }
+    }
+
+    /// Codificação numérica de `gateway_circuit_state` (spec §11.2): `0=closed
+    /// 1=half_open 2=open`. Uma métrica não carrega string; o texto vive no log
+    /// de transição, o número vive aqui.
+    pub fn as_code(self) -> i64 {
+        match self {
+            CircuitState::Closed => 0,
+            CircuitState::HalfOpen => 1,
+            CircuitState::Open => 2,
         }
     }
 }
@@ -125,16 +137,23 @@ pub struct CircuitBreaker {
     id: Arc<str>,
     policy: BreakerPolicy,
     clock: Arc<dyn Clock>,
+    metrics: Arc<Metrics>,
     inner: Mutex<Inner>,
 }
 
 impl CircuitBreaker {
-    pub fn new(id: Arc<str>, policy: BreakerPolicy, clock: Arc<dyn Clock>) -> Self {
+    pub fn new(
+        id: Arc<str>,
+        policy: BreakerPolicy,
+        clock: Arc<dyn Clock>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
         let window = SlidingWindow::new(policy.window);
         Self {
             id,
             policy,
             clock,
+            metrics,
             inner: Mutex::new(Inner {
                 state: CircuitState::Closed,
                 open_until_ms: 0,
@@ -239,6 +258,8 @@ impl CircuitBreaker {
             "circuito mudou de estado"
         );
         inner.state = to;
+        self.metrics
+            .record_circuit_transition(&self.id, to.as_str());
     }
 }
 
@@ -250,13 +271,15 @@ impl CircuitBreaker {
 pub struct BreakerRegistry {
     breakers: RwLock<HashMap<Arc<str>, Arc<CircuitBreaker>>>,
     clock: Arc<dyn Clock>,
+    metrics: Arc<Metrics>,
 }
 
 impl BreakerRegistry {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
+    pub fn new(clock: Arc<dyn Clock>, metrics: Arc<Metrics>) -> Self {
         Self {
             breakers: RwLock::new(HashMap::new()),
             clock,
+            metrics,
         }
     }
 
@@ -273,6 +296,7 @@ impl BreakerRegistry {
                 id.clone(),
                 policy.clone(),
                 self.clock.clone(),
+                self.metrics.clone(),
             ));
         };
 
@@ -283,6 +307,7 @@ impl BreakerRegistry {
                     id.clone(),
                     policy.clone(),
                     self.clock.clone(),
+                    self.metrics.clone(),
                 ))
             })
             .clone()
@@ -297,6 +322,15 @@ impl BreakerRegistry {
                 .collect(),
             Err(_) => Vec::new(),
         }
+    }
+}
+
+impl crate::observability::metrics::CircuitStateSource for BreakerRegistry {
+    fn circuit_states(&self) -> Vec<(Arc<str>, i64)> {
+        self.states()
+            .into_iter()
+            .map(|(id, state)| (id, state.as_code()))
+            .collect()
     }
 }
 
@@ -316,7 +350,12 @@ mod tests {
     }
 
     fn breaker(clock: Arc<TestClock>) -> CircuitBreaker {
-        CircuitBreaker::new("svc".into(), policy(), clock)
+        CircuitBreaker::new(
+            "svc".into(),
+            policy(),
+            clock,
+            Arc::new(Metrics::new().unwrap()),
+        )
     }
 
     fn registra(breaker: &CircuitBreaker, quantidade: usize, sucesso: bool) {
@@ -464,7 +503,10 @@ mod tests {
 
     #[test]
     fn o_registry_devolve_o_mesmo_breaker_para_o_mesmo_upstream() {
-        let registry = BreakerRegistry::new(Arc::new(TestClock::default()));
+        let registry = BreakerRegistry::new(
+            Arc::new(TestClock::default()),
+            Arc::new(Metrics::new().unwrap()),
+        );
         let id: Arc<str> = Arc::from("user-service");
 
         let um = registry.get(&id, &policy());

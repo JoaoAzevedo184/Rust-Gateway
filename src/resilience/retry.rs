@@ -4,6 +4,7 @@
 //! `POST /payments` após um timeout de leitura pode cobrar duas vezes, e nenhuma
 //! opção de configuração deveria tornar isso possível.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,6 +18,7 @@ use tower::{Layer, Service};
 
 use crate::config::RetryPolicy;
 use crate::error::GatewayError;
+use crate::observability::metrics::Metrics;
 use crate::resilience::AttemptOutcome;
 use crate::routing::layer::route_of;
 use crate::{BoxFuture, Request, Response};
@@ -83,14 +85,18 @@ fn pseudo_random() -> u64 {
     x
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RetryLayer {
     max_buffer_bytes: u64,
+    metrics: Arc<Metrics>,
 }
 
 impl RetryLayer {
-    pub fn new(max_buffer_bytes: u64) -> Self {
-        Self { max_buffer_bytes }
+    pub fn new(max_buffer_bytes: u64, metrics: Arc<Metrics>) -> Self {
+        Self {
+            max_buffer_bytes,
+            metrics,
+        }
     }
 }
 
@@ -101,6 +107,7 @@ impl<S> Layer<S> for RetryLayer {
         Retry {
             inner,
             max_buffer_bytes: self.max_buffer_bytes,
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -109,6 +116,7 @@ impl<S> Layer<S> for RetryLayer {
 pub struct Retry<S> {
     inner: S,
     max_buffer_bytes: u64,
+    metrics: Arc<Metrics>,
 }
 
 impl<S> Service<Request> for Retry<S>
@@ -128,8 +136,8 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        let policy = match route_of(req.extensions()) {
-            Some(route) => route.resilience.retry.clone(),
+        let (policy, route_id) = match route_of(req.extensions()) {
+            Some(route) => (route.resilience.retry.clone(), route.id.clone()),
             None => return Box::pin(async move { inner.call(req).await }),
         };
 
@@ -139,6 +147,7 @@ where
         }
 
         let max_buffer_bytes = self.max_buffer_bytes;
+        let metrics = self.metrics.clone();
 
         Box::pin(async move {
             // Repetir exige poder reenviar o corpo, e um corpo já consumido não
@@ -165,10 +174,25 @@ where
                 *req.uri_mut() = parts.uri.clone();
 
                 let response = inner.call(req).await?;
+                let failed_pre_response =
+                    AttemptOutcome::of(&response) == Some(AttemptOutcome::PreResponseFailure);
+
+                // A primeira tentativa não é "uma repetição"; só a segunda em
+                // diante conta para `gateway_retries_total`.
+                if attempt > 1 {
+                    metrics.record_retry(
+                        &route_id,
+                        if failed_pre_response {
+                            "failure"
+                        } else {
+                            "success"
+                        },
+                    );
+                }
 
                 // Só falha comprovadamente pré-resposta é repetida. Timeout e 5xx
                 // significam que o upstream pode ter processado a requisição.
-                if AttemptOutcome::of(&response) != Some(AttemptOutcome::PreResponseFailure) {
+                if !failed_pre_response {
                     return Ok(response);
                 }
 
